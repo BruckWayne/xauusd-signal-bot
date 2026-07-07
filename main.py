@@ -95,36 +95,79 @@ def render_chart_png(df: pd.DataFrame, label: str) -> bytes:
     return buf.read()
 
 
+def calc_atr(df: pd.DataFrame, period: int = 14):
+    """ATR (Average True Range) — dùng làm mốc khách quan cho biên độ thực tế,
+    để TP/SL không bị đặt vượt quá khả năng di chuyển giá trong phiên."""
+    if df is None or len(df) < period + 1:
+        return None
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    atr = tr.rolling(period).mean().iloc[-1]
+    return round(float(atr), 2) if pd.notna(atr) else None
+
+
 # ---------- Bước 3: Gọi Gemini Vision ----------
-PROMPT = """
+PROMPT_TEMPLATE = """
 Bạn là một trader chuyên nghiệp phân tích price action (KHÔNG dùng chỉ báo máy móc).
 Bạn được cung cấp 6 ảnh chart nến của XAUUSD theo thứ tự: M1, M5, M15, M30, H1, H4.
 
 Hãy phân tích đa khung thời gian theo phương pháp top-down (H4 -> H1 -> M30 -> M15 -> M5 -> M1):
 - Xác định xu hướng chính trên khung lớn (H4, H1)
 - Xác định vùng hỗ trợ/kháng cự, order block, vùng thanh khoản quan trọng
-- Tìm điểm vào lệnh hợp lý trên khung nhỏ (M15/M5/M1) theo xu hướng khung lớn
+- Tìm điểm vào lệnh (entry) hợp lý trên khung nhỏ (M15/M5/M1) theo xu hướng khung lớn
 - Chỉ đưa tín hiệu BUY/SELL khi có setup rõ ràng, nếu không có setup tốt thì trả lời "WAIT"
 
+QUY TẮC BẮT BUỘC — điểm entry và điểm chốt lời (TP) phải cùng một phương pháp, không được tách rời:
+- Nếu entry được xác định dựa trên cấu trúc M1/M5 (ví dụ: quét thanh khoản, phá vỡ cấu trúc nhỏ, order block M5),
+  thì TP phải là vùng thanh khoản / kháng cự-hỗ trợ / order block TIẾP THEO cùng logic cấu trúc đó trên khung lớn hơn
+  (M15/M30/H1) — KHÔNG được chọn TP theo số điểm tùy ý hoặc theo tỷ lệ R:R cố định.
+- SL đặt sau vùng cấu trúc vừa dùng để entry (dưới order block/đáy gần nhất khi BUY, trên order block/đỉnh gần nhất khi SELL).
+{atr_context}
+Dữ liệu ATR ở trên phản ánh biên độ trung bình thực tế — nếu TP dự kiến vượt quá khả năng di chuyển của giá trong
+khung thời gian giữ lệnh đề xuất, hãy chọn lại vùng TP gần hơn (thanh khoản/kháng cự-hỗ trợ gần nhất phù hợp) thay vì
+giữ nguyên TP xa.
+
+Về thời gian giữ lệnh: ưu tiên đề xuất THỜI GIAN VỪA PHẢI, không quá dài (tránh lệnh bị sideway/tin tức ăn mòn lợi
+nhuận, tránh phí qua đêm/gap cuối tuần), và không quá ngắn kiểu scalp giây/phút. Khung tham chiếu hợp lý: khoảng
+1–6 giờ cho một lệnh intraday dựa trên entry M1/M5 xác nhận theo xu hướng H1/H4.
+
 CHỈ trả lời bằng JSON hợp lệ, không thêm markdown, không thêm giải thích ngoài JSON:
-{
+{{
   "tin_hieu": "BUY" hoặc "SELL" hoặc "WAIT",
   "do_tin_cay": "cao/trung binh/thap",
   "xu_huong_chinh": "mô tả ngắn gọn xu huong H4/H1",
   "cau_truc_gia": "mô tả cấu trúc giá hiện tại (higher high/higher low, sideway, break of structure...)",
   "vung_gia_quan_trong": "liệt kê ngắn gọn các vùng hỗ trợ/kháng cự hoặc order block quan trọng đang theo dõi, kèm mức giá",
   "khung_gia_vao_lenh": "khung thời gian dùng để xác nhận điểm vào lệnh, ví dụ M5/M1",
+  "phuong_phap_tp": "giải thích ngắn gọn vì sao TP được chọn tại vùng đó, và nó liên hệ thế nào với logic đã dùng để xác định entry",
   "entry": số hoặc null,
   "stop_loss": số hoặc null,
   "take_profit": số hoặc null,
+  "thoi_gian_giu_lenh_de_xuat": "khoảng thời gian đề xuất giữ lệnh, ví dụ '2-4 giờ' (ưu tiên vừa phải, không quá dài)",
+  "dieu_kien_thoat_som": "điều kiện nên thoát lệnh sớm nếu setup mất hiệu lực trước khi tới TP/hết thời gian đề xuất",
   "kich_ban_khac": "kịch bản thay thế nếu giá đi ngược setup chính, hoặc null",
   "ly_do": "giải thích ngắn gọn bằng tiếng Việt, tối đa 4 câu"
-}
+}}
 """
 
 
-def call_gemini(images: dict) -> dict:
-    parts = [{"text": PROMPT}]
+def build_prompt(atr_h1, atr_h4) -> str:
+    if atr_h1 or atr_h4:
+        atr_context = (
+            f"\nBiên độ tham khảo (ATR 14 kỳ): H1 ≈ {atr_h1 if atr_h1 else 'N/A'} USD, "
+            f"H4 ≈ {atr_h4 if atr_h4 else 'N/A'} USD.\n"
+        )
+    else:
+        atr_context = "\n"
+    return PROMPT_TEMPLATE.format(atr_context=atr_context)
+
+
+def call_gemini(images: dict, atr_h1=None, atr_h4=None) -> dict:
+    prompt = build_prompt(atr_h1, atr_h4)
+    parts = [{"text": prompt}]
     for label, png_bytes in images.items():
         parts.append(
             {
@@ -255,6 +298,12 @@ def format_message(signal: dict) -> str:
         lines.append(f"🛑 <b>Stop Loss:</b>  <code>{_fmt_price(sl)}</code>" + (f"  (~{sl_dist:.2f} pt)" if sl_dist else ""))
         lines.append(f"✅ <b>Take Profit:</b>  <code>{_fmt_price(tp)}</code>" + (f"  (~{tp_dist:.2f} pt)" if tp_dist else ""))
         lines.append(f"⚖️ <b>Tỷ lệ R:R:</b> {f'1 : {rr}' if rr else 'N/A'}")
+        if signal.get("phuong_phap_tp"):
+            lines.append(f"📐 <b>Căn cứ chọn TP:</b> {signal.get('phuong_phap_tp')}")
+        lines.append("")
+        lines.append(f"⏳ <b>Thời gian giữ lệnh đề xuất:</b> {signal.get('thoi_gian_giu_lenh_de_xuat', 'N/A')}")
+        if signal.get("dieu_kien_thoat_som"):
+            lines.append(f"🚪 <b>Thoát sớm nếu:</b> {signal.get('dieu_kien_thoat_som')}")
         if signal.get("kich_ban_khac"):
             lines.append(f"🔄 <b>Kịch bản khác:</b> {signal.get('kich_ban_khac')}")
 
@@ -268,10 +317,12 @@ def format_message(signal: dict) -> str:
 # ---------- Main ----------
 def main():
     images = {}
+    dfs = {}
     for tv_interval, (label, size) in TIMEFRAMES.items():
         try:
             df = fetch_ohlc(tv_interval, size)
             images[label] = render_chart_png(df, label)
+            dfs[label] = df
             print(f"OK: lấy dữ liệu và vẽ chart {label}")
         except Exception as e:
             print(f"LỖI khi xử lý khung {label}: {e}", file=sys.stderr)
@@ -280,8 +331,11 @@ def main():
         send_telegram("⚠️ Bot lỗi: không lấy đủ dữ liệu chart để phân tích lần này.")
         sys.exit(1)
 
+    atr_h1 = calc_atr(dfs.get("H1"))
+    atr_h4 = calc_atr(dfs.get("H4"))
+
     try:
-        signal = call_gemini(images)
+        signal = call_gemini(images, atr_h1=atr_h1, atr_h4=atr_h4)
     except Exception as e:
         print(f"LỖI khi gọi Gemini: {e}", file=sys.stderr)
         send_telegram(f"⚠️ Bot lỗi khi gọi Gemini: {e}")
