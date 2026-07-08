@@ -62,6 +62,13 @@ TIMEFRAMES = {
 # để trải đều 7 request trong khoảng thời gian an toàn, tránh bị 429.
 TWELVEDATA_REQUEST_DELAY_SEC = 1.2
 
+# Lịch kinh tế công khai (không chính thức, không SLA) — dùng để bù lại phần
+# "Macro Filter" trong quy trình gốc, vì Gemini Vision không tự tra cứu được tin tức.
+FF_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+NEWS_LOOKAHEAD_HOURS = 12       # đưa vào prompt các sự kiện USD trong khoảng này
+HIGH_IMPACT_VETO_MINUTES = 60   # High impact trong X phút tới => bắt buộc NO TRADE
+NEWS_RELEVANT_CURRENCIES = {"USD"}  # XAUUSD nhạy nhất với dữ liệu/lãi suất USD
+
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -128,81 +135,159 @@ def calc_atr(df: pd.DataFrame, period: int = 14):
     return round(float(atr), 2) if pd.notna(atr) else None
 
 
+# ---------- Lịch kinh tế (Macro Filter) ----------
+def fetch_economic_calendar():
+    """Lấy lịch kinh tế tuần này từ nguồn công khai (ForexFactory / Fair Economy feed).
+    Đây là nguồn KHÔNG chính thức, không có SLA — nếu lỗi, bot vẫn chạy tiếp, chỉ là
+    không có ngữ cảnh tin tức cho lần phân tích đó (được ghi rõ trong thông báo)."""
+    try:
+        r = requests.get(FF_CALENDAR_URL, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"CẢNH BÁO: không lấy được lịch kinh tế: {e}", file=sys.stderr)
+        return None
+
+
+def parse_calendar_events(raw_events, now_utc: datetime, lookahead_hours: int = NEWS_LOOKAHEAD_HOURS):
+    """Lọc các sự kiện thuộc NEWS_RELEVANT_CURRENCIES, sắp diễn ra trong lookahead_hours
+    tới, trả về danh sách đã sắp xếp theo thời gian gần nhất trước."""
+    if not raw_events:
+        return []
+    upcoming = []
+    for ev in raw_events:
+        try:
+            ev_time_utc = datetime.fromisoformat(ev["date"]).astimezone(timezone.utc)
+        except Exception:
+            continue
+        if ev.get("country") not in NEWS_RELEVANT_CURRENCIES:
+            continue
+        delta_min = (ev_time_utc - now_utc).total_seconds() / 60
+        if 0 <= delta_min <= lookahead_hours * 60:
+            upcoming.append(
+                {
+                    "title": ev.get("title", "N/A"),
+                    "country": ev.get("country", "N/A"),
+                    "impact": ev.get("impact", "N/A"),
+                    "minutes_until": round(delta_min),
+                }
+            )
+    upcoming.sort(key=lambda x: x["minutes_until"])
+    return upcoming
+
+
+def build_news_context(upcoming_events):
+    """Tạo đoạn text mô tả lịch tin tức để đưa vào prompt, và xác định có nên ép
+    NO TRADE (veto cứng) theo quy tắc 'High impact trong 60 phút tới' hay không.
+    Trả về (text_cho_prompt, co_veto: bool)."""
+    if upcoming_events is None:
+        return (
+            "Không lấy được lịch kinh tế lần này (nguồn lỗi/không truy cập được) — "
+            "coi rủi ro tin tức là CHƯA XÁC MINH ĐƯỢC, không phải là 'không có tin'.",
+            False,
+        )
+
+    if not upcoming_events:
+        return (
+            f"Không có sự kiện USD nào trong {NEWS_LOOKAHEAD_HOURS} giờ tới theo lịch ForexFactory.",
+            False,
+        )
+
+    veto = any(
+        e["impact"] == "High" and e["minutes_until"] <= HIGH_IMPACT_VETO_MINUTES
+        for e in upcoming_events
+    )
+
+    lines = [
+        f"- [{e['impact']}] {e['title']} ({e['country']}) — còn {e['minutes_until']} phút"
+        for e in upcoming_events[:8]
+    ]
+    text = f"Lịch kinh tế {NEWS_LOOKAHEAD_HOURS}h tới (nguồn ForexFactory, chỉ USD):\n" + "\n".join(lines)
+    if veto:
+        text += (
+            f"\n⚠️ CÓ sự kiện HIGH IMPACT trong vòng {HIGH_IMPACT_VETO_MINUTES} phút tới. "
+            f"Theo quy tắc bắt buộc: PHẢI kết luận final_verdict = NO TRADE lần này, "
+            f"bất kể phân tích kỹ thuật cho kết quả gì."
+        )
+    return text, veto
+
+
 # ---------- Bước 3: Gọi Gemini Vision ----------
 SYSTEM_PROMPT = """
-Bạn là Chief Market Strategist & Risk Manager của một quỹ giao dịch chuyên XAUUSD.
-Nhiệm vụ của bạn KHÔNG phải là dự đoán giá, mà là đánh giá xác suất, nhận diện dấu vết
-dòng tiền tổ chức (Smart Money), loại bỏ setup chất lượng thấp, và chỉ đề xuất giao dịch
-khi thỏa các tiêu chí chuyên nghiệp nghiêm ngặt.
+Bạn là chuyên gia phân tích kỹ thuật XAUUSD theo phương pháp Smart Money Concept (SMC)
+kết hợp Top-Down Multi-Timeframe. Mục tiêu: đưa ra tín hiệu có xác suất cao dựa trên cấu
+trúc giá thực tế — không đoán mò, nhưng cũng KHÔNG tê liệt chỉ vì thiếu vài dữ liệu phụ
+trợ (volume, DXY...) mà hệ thống này vốn dĩ không có.
 
-Ưu tiên số 1: bảo toàn vốn. Ưu tiên số 2: cơ hội risk/reward bất đối xứng.
-Nếu bằng chứng không đủ, kết luận PHẢI là "NO TRADE". Không bao giờ ép ra tín hiệu.
-Không bao giờ tự bịa dữ liệu còn thiếu — nếu thiếu, hãy nêu rõ là thiếu và tự hạ điểm
-tin cậy tương ứng, tuyệt đối không giả định để lấp đầy khoảng trống.
+NGUYÊN TẮC:
+- Bảo toàn vốn là ưu tiên, nhưng KHÔNG đồng nghĩa với việc mặc định NO TRADE mỗi khi
+  thiếu dữ liệu phụ. Chỉ kết luận NO TRADE khi bản thân cấu trúc giá không đủ rõ ràng,
+  hoặc khi có veto tin tức thật sự (xem bước 0) — không phải vì "không có volume/DXY".
+- Khung thời gian lớn (D1/H4) quyết định bias chính; khung nhỏ (M15/M5) chỉ dùng để tìm
+  điểm vào lệnh khớp bias đó, không dùng để đảo ngược bias trừ khi có tín hiệu đảo chiều
+  thật sự rõ ràng (CHOCH + phá vỡ cấu trúc trên chính khung lớn).
 
-Suy luận nội bộ theo kiểu Bayesian: mỗi bằng chứng mới làm tăng/giảm/không đổi xác suất
-của từng kịch bản — không đơn thuần đếm số tín hiệu tăng vs giảm. Cấu trúc khung thời
-gian lớn, bối cảnh vĩ mô và các sự kiện thanh khoản phải được đánh trọng số cao hơn hẳn
-so với mẫu hình nến ở khung nhỏ.
-
-=== DỮ LIỆU ĐƯỢC CUNG CẤP LẦN NÀY ===
-Bạn nhận được {so_luong_anh} ảnh chart nến XAUUSD theo thứ tự top-down: {danh_sach_khung}.
+=== DỮ LIỆU ĐƯỢC CUNG CẤP ===
+{so_luong_anh} ảnh chart XAUUSD theo thứ tự top-down: {danh_sach_khung}.
 {atr_context}
-KHÔNG có dữ liệu Volume, DXY, US10Y Yield, chính sách Fed, hay lịch kinh tế thời gian
-thực trong lần chạy này. Với các mục này: đặt điểm số ở mức thấp/trung tính, ghi rõ
-"thiếu dữ liệu" trong phần ghi chú tương ứng, và KHÔNG tự suy đoán tin tức sắp có hay
-không. Đây là khác biệt duy nhất so với quy trình đầy đủ; mọi bước phân tích khác vẫn
-áp dụng đầy đủ trên dữ liệu giá có sẵn.
+{news_context}
 
-=== QUY TRÌNH PHÂN TÍCH (tuân thủ đúng thứ tự) ===
-1. Market Regime: xác định 1 chế độ thị trường đang chi phối (Trending/Range/Expansion/
-   Compression/Accumulation/Distribution/Transition/Reversal) và lý do.
-2. Multi-timeframe: với mỗi khung có ảnh, xác định xu hướng, HH/HL hoặc LH/LL, swing
-   high/low, BOS/CHOCH, cấu trúc internal/external. Tính % đồng thuận giữa các khung.
-3. Smart Money Concept: thanh khoản (equal highs/lows, buy-side/sell-side liquidity,
-   sweep, inducement), order block, breaker/mitigation block, fair value gap, vùng
-   premium/discount/equilibrium — nêu vùng nào còn hiệu lực.
-4. Supply/Demand: xác định vùng cung/cầu mạnh-yếu, mới-đã test-đã phá, xếp hạng.
-5. Price Action: momentum candle, pin bar, engulfing, false breakout, swing failure
-   pattern, nén/mở rộng biên độ — suy luận dòng tiền tổ chức đang làm gì.
-6. Volatility: dùng ATR đã cho (nếu có) để đánh giá TP dự kiến có thực tế trong thời
-   gian giữ lệnh đề xuất hay không.
-7. Session: phiên hiện tại (Á/Âu/Mỹ), có phải kill zone ICT không, thời điểm này có ủng
-   hộ việc vào lệnh không.
-8. Confluence scoring: chấm điểm 10 hạng mục (Macro, Cấu trúc thị trường, Thanh khoản,
-   Order Block, Price Action, Supply/Demand, Volume, Session, Risk/Reward, Volatility),
-   mỗi hạng mục tối đa 20 điểm — hạng mục nào thiếu dữ liệu thực (Macro, Volume) chấm
-   thấp và ghi rõ lý do. Tổng /200, quy đổi confidence% = tổng/2.
-   Ngưỡng: 95-100 Exceptional, 90-94 Very High, 85-89 High, 75-84 Moderate,
-   dưới 75 → PHẢI là NO TRADE.
-9. Nếu confidence ≥ 75: xây dựng kế hoạch giao dịch với entry, SL, TP1/TP2/TP3, R:R,
-   xác suất, break-even point, trailing stop, kế hoạch chốt lời từng phần, thời gian
-   giữ lệnh tối đa. ƯU TIÊN thời gian giữ lệnh VỪA PHẢI (khoảng 1-6 giờ cho lệnh
-   intraday dựa trên entry M5/M15 xác nhận theo xu hướng H1/H4/D1) — không quá dài
-   (tránh sideway/tin tức/phí qua đêm ăn mòn lợi nhuận), không quá ngắn kiểu scalp
-   giây/phút.
-   QUY TẮC BẮT BUỘC: TP phải được xác định BẰNG CÙNG PHƯƠNG PHÁP đã dùng để xác định
-   entry (cùng logic cấu trúc/thanh khoản/order block), tuyệt đối không chọn TP theo
-   một tỷ lệ R:R áp đặt sẵn tách rời khỏi cấu trúc giá thực tế.
-10. Risk management: % rủi ro tối đa đề xuất, quy mô vị thế gợi ý, lỗ tối đa/ngày,
-    lỗ tối đa/tuần, có nên vào lệnh từng phần (scale-in) hay chốt từng phần
-    (scale-out) hay không.
-11. Invalidation: nêu chính xác hành động giá nào sẽ vô hiệu hóa setup.
-12. Final verdict: CHỈ MỘT trong "BUY", "SELL", "NO TRADE".
-13. Executive summary: thiên hướng tổ chức, lý do chính, thanh khoản/order block chính,
-    rủi ro chính, điểm tin cậy, và 1 đoạn tóm tắt điều hành ngắn gọn bằng tiếng Việt.
+Bot KHÔNG có Volume/DXY/US10Y trong lần chạy này — đây là giới hạn đã biết từ trước,
+không phải lý do để tự động hạ tiêu chuẩn hay NO TRADE. Chỉ ghi chú "không có dữ liệu
+này" ở volume_note, KHÔNG dùng nó để trừ điểm hay chặn tín hiệu.
 
-QUY TẮC NGHIÊM NGẶT: không tạo tín hiệu chỉ vì được hỏi; không phớt lờ khung thời gian
-lớn; không đi ngược cấu trúc thị trường trừ khi có đảo chiều được xác nhận rõ; nếu bằng
-chứng mâu thuẫn thì giảm điểm tin cậy; nếu confidence dưới 75 thì bắt buộc NO TRADE;
-luôn ưu tiên bảo toàn vốn hơn cơ hội; không bịa dữ liệu chart còn thiếu — nếu ảnh không
-đủ rõ, hãy nêu rõ cần thêm thông tin gì.
+=== QUY TRÌNH PHÂN TÍCH ===
+0. News Filter: đọc {news_context} ở trên. Nếu có cảnh báo veto (High impact trong
+   {high_impact_veto_minutes} phút tới) → final_verdict PHẢI là "NO TRADE" ngay lập tức,
+   bỏ qua các bước còn lại. Tin Medium/Low chỉ cần ghi chú trong news_risk_note, không
+   cần hạ tiêu chuẩn phân tích kỹ thuật.
+1. HTF Bias: xác định xu hướng D1 + H4. Đồng thuận rõ ràng → bias mạnh. Mâu thuẫn → bias
+   yếu (vẫn có thể giao dịch nếu H1 xác nhận đảo chiều rõ ràng, nhưng ghi chú thận trọng).
+2. Liquidity & Order Block: tìm vùng thanh khoản (equal high/low vừa bị quét) và order
+   block/FVG gần nhất còn hiệu lực trên H1/H4, cùng hướng với HTF bias.
+3. LTF Confirmation: trên M15/M5, tìm xác nhận cấu trúc (BOS/CHOCH, momentum candle,
+   engulfing...) khớp hướng giao dịch, xảy ra đúng tại vùng order block/thanh khoản đó.
+4. Volatility check: dùng ATR đã cho để xác nhận TP dự kiến khả thi trong thời gian giữ
+   lệnh đề xuất.
+5. Session: phiên hiện tại có thuận lợi không — đây là yếu tố ĐIỀU CHỈNH độ tin cậy
+   (cộng/trừ vài %), KHÔNG phải điều kiện loại trừ.
+
+=== CHECKLIST QUYẾT ĐỊNH (core_checklist, đánh giá true/false) ===
+- htf_bias_ro_rang: D1+H4 đồng thuận, HOẶC có đảo chiều H1 được xác nhận rõ ràng.
+- vung_thanh_khoan_ob_hop_le: có order block/vùng thanh khoản cụ thể, chưa bị phá vỡ.
+- xac_nhan_ltf: có xác nhận cấu trúc rõ ràng trên M15/M5 tại đúng vùng đó.
+- rr_hop_ly: R:R tới TP1 ước tính ≥ 1:1.2 và khả thi theo ATR.
+
+QUY TẮC RA QUYẾT ĐỊNH (bắt buộc tuân thủ đúng như sau, không tự thêm điều kiện khác):
+- Cả 4 mục đều true → final_verdict = "BUY"/"SELL" theo hướng bias. confidence_percent
+  phản ánh đúng mức độ rõ ràng thực tế quan sát được (thường rơi vào khoảng 65-90%).
+  Session thuận lợi có thể cộng thêm vài %, không có ngưỡng tối thiểu nào khác.
+- Đúng 3/4 mục true (không thiếu htf_bias_ro_rang hoặc xac_nhan_ltf) → vẫn có thể ra
+  BUY/SELL nhưng confidence thấp hơn (45-60%), nêu rõ mục nào yếu trong executive_summary.
+- Thiếu từ 2 mục trở lên, HOẶC htf_bias_ro_rang=false, HOẶC xac_nhan_ltf=false →
+  final_verdict = "NO TRADE".
+
+=== OUTPUT CÒN LẠI ===
+- market_regime + regime_reason: mô tả ngắn gọn (Trending/Range/Expansion/Compression...).
+- mtf_summary, smc_summary (thanh khoản/OB/FVG), price_action_summary: ngắn gọn, cụ thể,
+  nêu đúng mức giá quan sát được trên chart.
+- Nếu BUY/SELL: trade_plan đầy đủ — entry, SL, TP1/TP2/TP3. TP PHẢI được xác định BẰNG
+  CÙNG PHƯƠNG PHÁP đã dùng để tìm entry (vùng thanh khoản/order block kế tiếp cùng logic),
+  tuyệt đối KHÔNG áp đặt một tỷ lệ R:R cố định tách rời khỏi cấu trúc giá thực tế. Kèm
+  break-even, trailing stop, kế hoạch chốt lời từng phần, thời gian giữ lệnh tối đa (ưu
+  tiên 1-6 giờ — đủ để cấu trúc entry M5/M15 phát triển theo H1/H4, không quá dài để
+  tránh sideway/tin tức/phí qua đêm ăn mòn lợi nhuận).
+- risk_management: % rủi ro tối đa/lệnh, khối lượng đề xuất, lỗ tối đa ngày/tuần,
+  scale-in/scale-out.
+- invalidation: hành động giá cụ thể nào sẽ vô hiệu hóa setup.
+- executive_summary: 1 đoạn tóm tắt ngắn gọn, rõ ràng bằng tiếng Việt, nêu rõ checklist
+  nào đạt/không đạt.
 
 Chỉ trả lời theo đúng JSON schema đã cấu hình, không thêm văn bản ngoài JSON.
 """
 
 
-def build_prompt(image_labels, atr_h1, atr_h4) -> str:
+def build_prompt(image_labels, atr_h1, atr_h4, news_context: str) -> str:
     if atr_h1 or atr_h4:
         atr_context = (
             f"Biên độ tham khảo (ATR 14 kỳ): H1 ≈ {atr_h1 if atr_h1 else 'N/A'} USD, "
@@ -215,6 +300,8 @@ def build_prompt(image_labels, atr_h1, atr_h4) -> str:
         so_luong_anh=len(image_labels),
         danh_sach_khung=", ".join(image_labels),
         atr_context=atr_context,
+        news_context=news_context,
+        high_impact_veto_minutes=HIGH_IMPACT_VETO_MINUTES,
     )
 
 
@@ -235,19 +322,14 @@ RESPONSE_SCHEMA = {
         "volume_note": {"type": "STRING"},
         "volatility_note": {"type": "STRING"},
         "session_note": {"type": "STRING"},
-        "confluence_scores": {
+        "news_risk_note": {"type": "STRING"},
+        "core_checklist": {
             "type": "OBJECT",
             "properties": {
-                "macro": {"type": "INTEGER"},
-                "cau_truc": {"type": "INTEGER"},
-                "thanh_khoan": {"type": "INTEGER"},
-                "order_block": {"type": "INTEGER"},
-                "price_action": {"type": "INTEGER"},
-                "supply_demand": {"type": "INTEGER"},
-                "volume": {"type": "INTEGER"},
-                "session": {"type": "INTEGER"},
-                "risk_reward": {"type": "INTEGER"},
-                "volatility": {"type": "INTEGER"},
+                "htf_bias_ro_rang": {"type": "BOOLEAN"},
+                "vung_thanh_khoan_ob_hop_le": {"type": "BOOLEAN"},
+                "xac_nhan_ltf": {"type": "BOOLEAN"},
+                "rr_hop_ly": {"type": "BOOLEAN"},
             },
         },
         "trade_plan": {
@@ -292,8 +374,8 @@ RESPONSE_SCHEMA = {
 }
 
 
-def call_gemini(images: dict, atr_h1=None, atr_h4=None) -> dict:
-    prompt = build_prompt(list(images.keys()), atr_h1, atr_h4)
+def call_gemini(images: dict, news_context: str, atr_h1=None, atr_h4=None) -> dict:
+    prompt = build_prompt(list(images.keys()), atr_h1, atr_h4, news_context)
     parts = [{"text": prompt}]
     for label, png_bytes in images.items():
         parts.append(
@@ -384,16 +466,14 @@ def confidence_visual(percent):
         return "⬜⬜⬜⬜⬜", "N/A"
     filled = min(5, max(0, round(percent / 20)))
     bar = "🟩" * filled + "⬜" * (5 - filled)
-    if percent >= 95:
-        label = "Exceptional"
-    elif percent >= 90:
-        label = "Very High"
-    elif percent >= 85:
-        label = "High"
-    elif percent >= 75:
-        label = "Moderate"
+    if percent >= 75:
+        label = "Cao"
+    elif percent >= 60:
+        label = "Trung bình"
+    elif percent >= 45:
+        label = "Thấp"
     else:
-        label = "Dưới ngưỡng (NO TRADE)"
+        label = "Rất thấp / NO TRADE"
     return bar, label
 
 
@@ -432,19 +512,20 @@ def format_message(signal: dict) -> str:
     if signal.get("price_action_summary"):
         lines.append(f"🕯 <b>Price Action:</b> {signal.get('price_action_summary')}")
 
-    scores = signal.get("confluence_scores") or {}
-    if scores:
-        total = sum(v for v in scores.values() if isinstance(v, (int, float)))
+    checklist = signal.get("core_checklist") or {}
+    if checklist:
         label_map = {
-            "macro": "Macro", "cau_truc": "Cấu trúc", "thanh_khoan": "Thanh khoản",
-            "order_block": "Order Block", "price_action": "Price Action",
-            "supply_demand": "Supply/Demand", "volume": "Volume", "session": "Session",
-            "risk_reward": "Risk/Reward", "volatility": "Volatility",
+            "htf_bias_ro_rang": "HTF Bias rõ ràng",
+            "vung_thanh_khoan_ob_hop_le": "Thanh khoản/OB hợp lệ",
+            "xac_nhan_ltf": "Xác nhận LTF (M15/M5)",
+            "rr_hop_ly": "R:R hợp lý theo ATR",
         }
-        score_line = " | ".join(f"{label_map.get(k, k)} {v}/20" for k, v in scores.items())
         lines.append("")
-        lines.append(f"🧮 <b>Confluence:</b> {total}/200")
-        lines.append(f"<i>{score_line}</i>")
+        lines.append("🧮 <b>Checklist:</b>")
+        for k, label in label_map.items():
+            v = checklist.get(k)
+            mark = "✅" if v else ("❌" if v is False else "➖")
+            lines.append(f"{mark} {label}")
 
     if verdict in ("BUY", "SELL") and tp:
         lines.append("")
@@ -515,6 +596,17 @@ def format_message(signal: dict) -> str:
     if signal.get("missing_data_note"):
         lines.append(f"❓ <b>Dữ liệu còn thiếu:</b> {signal.get('missing_data_note')}")
 
+    upcoming_news = signal.get("_upcoming_news") or []
+    if upcoming_news or signal.get("news_risk_note"):
+        lines.append("")
+        lines.append("━━━ <b>LỊCH TIN TỨC (USD)</b> ━━━")
+        if upcoming_news:
+            for e in upcoming_news[:6]:
+                impact_emoji = {"High": "🔴", "Medium": "🟠", "Low": "⚪️", "Holiday": "🏖"}.get(e["impact"], "⚪️")
+                lines.append(f"{impact_emoji} {e['title']} — còn {e['minutes_until']} phút")
+        if signal.get("news_risk_note"):
+            lines.append(f"📰 <b>Đánh giá rủi ro tin tức:</b> {signal.get('news_risk_note')}")
+
     lines.append("")
     lines.append(f"📝 <b>Executive Summary:</b> {signal.get('executive_summary', '')}")
     lines.append("")
@@ -547,12 +639,32 @@ def main():
     atr_h1 = calc_atr(dfs.get("H1"))
     atr_h4 = calc_atr(dfs.get("H4"))
 
+    now_utc = datetime.now(timezone.utc)
+    raw_calendar = fetch_economic_calendar()
+    upcoming_events = parse_calendar_events(raw_calendar, now_utc)
+    news_context, news_veto = build_news_context(upcoming_events)
+    if news_veto:
+        print("CẢNH BÁO: có tin tức High Impact trong khung giờ veto — sẽ ép NO TRADE.")
+
     try:
-        signal = call_gemini(images, atr_h1=atr_h1, atr_h4=atr_h4)
+        signal = call_gemini(images, news_context, atr_h1=atr_h1, atr_h4=atr_h4)
     except Exception as e:
         print(f"LỖI khi gọi Gemini: {e}", file=sys.stderr)
         send_telegram(f"⚠️ Bot lỗi khi gọi Gemini: {e}")
         sys.exit(1)
+
+    # Ép cứng bằng code, không chỉ dựa vào việc model tuân thủ prompt: nếu có sự kiện
+    # High Impact trong khung giờ veto, luôn buộc NO TRADE bất kể Gemini trả về gì.
+    if news_veto and signal.get("final_verdict") != "NO TRADE":
+        signal["final_verdict"] = "NO TRADE"
+        signal["trade_plan"] = None
+        signal["news_risk_note"] = (
+            (signal.get("news_risk_note") or "")
+            + " [Hệ thống tự động ép NO TRADE do có tin tức High Impact sắp diễn ra, "
+            "bất kể model đề xuất gì.]"
+        ).strip()
+
+    signal["_upcoming_news"] = upcoming_events or []
 
     message = format_message(signal)
 
