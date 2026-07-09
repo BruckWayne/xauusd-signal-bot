@@ -2,13 +2,15 @@ name: XAUUSD Hourly Signal
 
 on:
   schedule:
-    # Chạy vào phút 2 mỗi giờ (UTC). GitHub cron có thể trễ vài phút vào giờ cao điểm.
+    # Chạy vào phút 2 mỗi giờ UTC. GitHub cron có thể trễ vài phút.
     - cron: "2 * * * *"
-  workflow_dispatch: {}   # cho phép bấm chạy tay để test
+  workflow_dispatch: {}
 
 jobs:
   run-signal:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -17,6 +19,7 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -27,4 +30,21 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MIN_CONFIDENCE: "70"
+          MIN_RR: "1.2"
+          MAX_ENTRY_DISTANCE_ATR: "0.45"
+          NEWS_LOOKAHEAD_HOURS: "6"
+          HIGH_IMPACT_VETO_BEFORE_MINUTES: "60"
+          HIGH_IMPACT_VETO_AFTER_MINUTES: "30"
+          SEND_NO_TRADE: "true"
+          LOG_DIR: "logs"
         run: python main.py
+
+      - name: Upload signal logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: xauusd-signal-logs
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 30
