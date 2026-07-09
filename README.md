@@ -1,83 +1,127 @@
-# XAUUSD Multi-Timeframe Vision Signal Bot
+# XAUUSD Multi-Timeframe Vision Signal Bot — bản nâng cấp
 
-Bot tự động mỗi giờ: lấy dữ liệu XAUUSD 6 khung thời gian (M1→H4), vẽ chart,
-gửi cho Gemini Vision phân tích price action, và bắn tín hiệu vào Telegram.
-Chạy hoàn toàn miễn phí trên GitHub Actions.
+Bot tự động lấy dữ liệu XAUUSD đa khung **H4/H1/M15/M5**, vẽ chart, gửi cho Gemini Vision phân tích Price Action + Order Block, sau đó chạy thêm một lớp **validator bằng code** trước khi gửi tín hiệu lên Telegram.
 
-## Cài đặt (làm 1 lần)
+> Mục tiêu của bản nâng cấp: không để AI Vision quyết định một mình. Gemini phân tích chart, còn code kiểm duyệt lại tín hiệu bằng rule kỹ thuật, tin tức, R:R, ATR và confidence.
 
-### 1. Fork / tạo repo này trên GitHub
-- Đăng nhập GitHub → **New repository** → đặt tên (ví dụ `xauusd-signal-bot`) → Public → Create
-- Upload toàn bộ các file trong thư mục này lên repo (kéo thả qua giao diện web,
-  hoặc dùng `git push` nếu quen dùng git)
+## Cấu trúc file
 
-### 2. Lấy 4 API key / thông tin cần thiết
+```text
+.
+├── main.py
+├── requirements.txt
+└── .github/workflows/signal.yml
+```
 
-| Biến | Lấy ở đâu |
+## Chức năng chính
+
+1. Lấy dữ liệu XAU/USD từ Twelve Data cho 4 khung: **H4, H1, M15, M5**.
+2. Vẽ chart nến có thêm EMA 20/50/200 và đường giá hiện tại.
+3. Tính dữ liệu định lượng:
+   - ATR H1
+   - EMA 20/50/200
+   - bias H4/H1
+   - swing high/swing low gần nhất
+4. Kiểm tra lịch tin tức USD High Impact từ ForexFactory feed.
+5. Gửi ảnh chart + dữ liệu định lượng cho Gemini Vision.
+6. Gemini trả JSON theo schema: `BUY`, `SELL` hoặc `NO TRADE`.
+7. Code chạy validator sau Gemini:
+   - chặn lệnh nếu có tin USD High Impact trong vùng cấm,
+   - chặn nếu không xác minh được lịch tin,
+   - chặn nếu confidence thấp,
+   - chặn nếu entry/SL/TP sai cấu trúc,
+   - chặn nếu R:R thấp,
+   - chặn nếu SL quá rộng/quá sát so với ATR,
+   - chặn nếu entry quá xa giá hiện tại,
+   - chặn nếu BUY/SELL ngược hoàn toàn bias H4/H1.
+8. Gửi Telegram và ghi log lịch sử vào `logs/signals.csv` và `logs/signals.jsonl`.
+9. Workflow GitHub upload log thành artifact sau mỗi lần chạy để bạn tải về kiểm tra.
+
+## Cài đặt GitHub Secrets
+
+Vào repo GitHub → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**, thêm 4 biến bắt buộc:
+
+| Biến | Ý nghĩa |
 |---|---|
-| `TWELVEDATA_API_KEY` | https://twelvedata.com/ → đăng ký free → Dashboard → API Key |
-| `GEMINI_API_KEY` | https://aistudio.google.com/ → Get API key → Create API key |
-| `TELEGRAM_TOKEN` | Token bot bạn đã tạo với @BotFather |
-| `TELEGRAM_CHAT_ID` | Gửi 1 tin cho bot, sau đó mở `https://api.telegram.org/bot<TOKEN>/getUpdates`, tìm `"chat":{"id": ...}` |
+| `TWELVEDATA_API_KEY` | API key Twelve Data |
+| `GEMINI_API_KEY` | API key Google AI Studio/Gemini |
+| `TELEGRAM_TOKEN` | Token bot Telegram từ BotFather |
+| `TELEGRAM_CHAT_ID` | Chat ID nhận tín hiệu |
 
-### 3. Thêm secrets vào GitHub repo
+## Biến cấu hình tùy chọn
 
-Vào repo → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**,
-thêm lần lượt 4 secret với đúng tên ở trên (viết hoa, đúng chính tả):
+Có thể thêm trong workflow hoặc GitHub Secrets/Variables nếu muốn tinh chỉnh:
 
-- `TWELVEDATA_API_KEY`
-- `GEMINI_API_KEY`
-- `TELEGRAM_TOKEN`
-- `TELEGRAM_CHAT_ID`
-
-### 4. Bật GitHub Actions
-
-Vào tab **Actions** của repo → nếu thấy thông báo "Workflows aren't running", bấm
-**I understand my workflows, go ahead and enable them**.
-
-### 5. Chạy thử ngay (không cần đợi đến giờ)
-
-Vào tab **Actions** → chọn workflow **XAUUSD Hourly Signal** ở cột trái →
-bấm **Run workflow** (nút màu xanh bên phải) → **Run workflow**.
-
-Đợi khoảng 30-60 giây, kiểm tra Telegram xem có tin nhắn chưa.
-Nếu lỗi, bấm vào lần chạy đó trong Actions để xem log chi tiết (rất dễ đọc, báo lỗi rõ ràng).
-
-## Cách hoạt động
-
-1. `main.py` gọi Twelve Data lấy nến M1, M5, M15, M30, H1, H4 của XAU/USD
-2. Vẽ 6 chart bằng `mplfinance`, giữ trong bộ nhớ (không lưu file để tránh phình repo)
-3. Gửi cả 6 ảnh + 1 prompt phân tích top-down cho model `gemini-2.5-flash`
-   (model có vision, miễn phí, ~1500 request/ngày)
-4. Gemini trả JSON gồm tín hiệu BUY/SELL/WAIT, entry, SL, TP, lý do
-5. Bot format và gửi tin nhắn Telegram
+| Biến | Mặc định | Ý nghĩa |
+|---|---:|---|
+| `MIN_CONFIDENCE` | `70` | Confidence tối thiểu để cho phép BUY/SELL |
+| `MIN_RR` | `1.2` | R:R tối thiểu với TP1 |
+| `MAX_ENTRY_DISTANCE_ATR` | `0.45` | Entry không được cách giá hiện tại quá 0.45 ATR H1 |
+| `MAX_SL_ATR_MULTIPLIER` | `1.35` | SL không được rộng hơn 1.35 ATR H1 |
+| `MIN_SL_ATR_MULTIPLIER` | `0.08` | SL không được quá sát so với ATR H1 |
+| `NEWS_LOOKAHEAD_HOURS` | `6` | Số giờ nhìn trước lịch tin High Impact |
+| `HIGH_IMPACT_VETO_BEFORE_MINUTES` | `60` | Cấm giao dịch trước tin High Impact |
+| `HIGH_IMPACT_VETO_AFTER_MINUTES` | `30` | Cấm giao dịch sau tin High Impact |
+| `SEND_NO_TRADE` | `true` | Có gửi Telegram khi NO TRADE hay không |
+| `LOG_DIR` | `logs` | Thư mục lưu log |
 
 ## Lịch chạy
 
-Định nghĩa trong `.github/workflows/signal.yml`, mặc định `cron: "2 * * * *"`
-(phút thứ 2 mỗi giờ, giờ UTC). Muốn đổi tần suất (ví dụ 30 phút/lần), sửa thành
-`*/30 * * * *`.
+Workflow mặc định chạy vào phút thứ 2 mỗi giờ theo UTC:
 
-Lưu ý: cron của GitHub Actions **không đảm bảo chạy đúng giây/phút**, có thể trễ
-vài phút vào giờ cao điểm. Đây là giới hạn chung của GitHub, không phải lỗi code.
+```yaml
+- cron: "2 * * * *"
+```
 
-## Giới hạn cần biết
+Nếu muốn chạy 30 phút/lần:
 
-- **GitHub tự tắt scheduled workflow nếu repo không có commit nào trong 60 ngày.**
-  Nếu dùng lâu dài, thỉnh thoảng vào repo commit gì đó (sửa README chẳng hạn) để giữ workflow hoạt động.
-- Free tier Twelve Data: ~800 request/ngày, 8 request/phút — với lịch chạy 1 lần/giờ x 6 khung
-  = 144 request/ngày, thoải mái trong hạn mức.
-- Free tier Gemini: model Flash gói free tier đủ dùng cho tần suất theo giờ, nhưng
-  Google có thể thay đổi hạn mức bất kỳ lúc nào — nếu thấy lỗi 429 (quá hạn mức),
-  giảm tần suất chạy hoặc đợi qua ngày hôm sau (hạn mức reset theo giờ Thái Bình Dương).
-- **Đây KHÔNG phải công cụ phân tích kỹ thuật đáng tin cậy tuyệt đối.** Vision LLM
-  có thể đọc sai chart, nhận diện sai xu hướng. Hãy test trên tài khoản demo một
-  thời gian dài trước khi cân nhắc dùng cho giao dịch thật, và luôn tự quản lý
-  rủi ro (không copy y nguyên SL/TP mà không kiểm tra lại).
+```yaml
+- cron: "*/30 * * * *"
+```
 
-## Tùy chỉnh thêm (gợi ý, tự làm)
+Lưu ý: GitHub Actions cron có thể chạy trễ vài phút vào giờ cao điểm.
 
-- Thêm log lịch sử tín hiệu vào 1 file JSON/CSV trong repo để sau này đánh giá
-  độ chính xác của bot
-- Thêm điều kiện: chỉ gửi Telegram khi `tin_hieu != "WAIT"` để đỡ spam
-- Luân phiên gọi thêm model khác (nếu có ngân sách) để so sánh chéo kết quả
+## Cách chạy thử
+
+1. Upload các file lên repo GitHub.
+2. Đảm bảo file workflow nằm đúng đường dẫn: `.github/workflows/signal.yml`.
+3. Vào tab **Actions**.
+4. Chọn workflow **XAUUSD Hourly Signal**.
+5. Bấm **Run workflow**.
+6. Kiểm tra Telegram và log trong phần artifact của lần chạy.
+
+## Cách đọc log
+
+Sau mỗi lần chạy, workflow upload thư mục `logs` thành artifact tên `xauusd-signal-logs`.
+
+Trong đó:
+
+- `signals.csv`: dễ mở bằng Excel/Google Sheets.
+- `signals.jsonl`: phù hợp để xử lý bằng Python sau này.
+
+Các cột quan trọng:
+
+| Cột | Ý nghĩa |
+|---|---|
+| `final_verdict` | Kết luận cuối sau validator |
+| `confidence_percent` | Độ tin cậy AI trả về |
+| `risk_reward_tp1` | R:R đến TP1 |
+| `atr_h1` | ATR H1 tại thời điểm chạy |
+| `h4_bias`, `h1_bias` | Bias định lượng từ EMA |
+| `news_veto` | Có bị chặn bởi tin tức hay không |
+| `ghi_chu` | Lý do AI/validator |
+
+## Gợi ý vận hành thực tế
+
+- Nên chạy demo tối thiểu vài tuần trước khi dùng cho quyết định thật.
+- Không nên tự động vào lệnh ngay từ Telegram nếu chưa có thống kê hiệu quả.
+- Sau khi có đủ log, hãy đánh giá:
+  - tỷ lệ đúng sau 1h/3h/6h,
+  - lệnh bị chặn bởi validator có hợp lý không,
+  - R:R trung bình,
+  - thời điểm bot hay sai nhất,
+  - loại tin tức nào làm tín hiệu nhiễu nhiều nhất.
+
+## Lưu ý rủi ro
+
+Đây là công cụ hỗ trợ phân tích kỹ thuật bằng AI, không phải khuyến nghị đầu tư. AI Vision có thể đọc sai chart, dữ liệu API có thể lỗi hoặc trễ, lịch tin tức dùng nguồn công khai không chính thức. Luôn tự kiểm tra lại và quản lý rủi ro.
