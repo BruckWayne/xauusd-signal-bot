@@ -1,102 +1,92 @@
 XAUUSD AI Vision Scalp Bot
 
-Bản này chuyển hệ thống từ intraday sang scalp theo trình tự:
+Phương pháp: H1 bias → M15 setup → M5 confirmation → M1 trigger.
 
-H1 bias → M15 setup → M5 confirmation → M1 trigger
+Lỗi đã sửa
 
-Tần suất hợp lý
+Bản cũ có sự không thống nhất:
 
-Workflow chạy mỗi 5 phút, gần sau khi nến M5 đóng. GitHub Actions không phù hợpvới gọi mỗi phút hoặc theo tick vì lịch có thể trễ. Code chỉ gọi Gemini khi prefilterphát hiện setup tiềm năng; nếu thị trường không đủ điều kiện thì chỉ ghi log.
+README hướng dẫn run_mode=test nhưng workflow chỉ có input force_ai.
 
-Cách giảm API
+main.py không gửi TEST STARTED như README mô tả.
 
-Bot chỉ gọi Twelve Data một lần cho M1 (outputsize=5000) rồi resample thànhM5/M15/H1/H4. Nhờ vậy lịch 5 phút không cần gọi riêng từng timeframe.
+Prefilter/news veto/WAIT/NO TRADE có thể khiến workflow chạy xong mà Telegram im lặng.
 
-Khung vận hành
+Nếu secret thiếu, chương trình lỗi ngay khi import và không có chẩn đoán rõ.
 
-Khung
+Không có bước kiểm tra độc lập getMe và sendMessage của Telegram.
 
-Vai trò
+Bản này xử lý riêng kết nối Telegram trước khi lấy dữ liệu thị trường hoặc gọi Gemini.
 
-H1
+Cách test chính xác
 
-Bias và cản lớn
+Ghi đè cả bốn file trong repository.
 
-M15
+Đảm bảo workflow nằm đúng đường dẫn .github/workflows/signal.yml.
 
-Setup và location
+Commit các file vào default branch của repository.
 
-M5
+Vào Actions → XAUUSD Scalp Signal → Run workflow.
 
-Xác nhận cấu trúc
+Chọn run_mode = test.
 
-M1
+Trong chế độ test, thứ tự phải là:
 
-Trigger/entry
+Validate Python code báo SELF_TEST_OK.
 
-H4
+Verify required secrets báo cả bốn secret là configured.
 
-Context phụ
+Telegram connection test gửi tin:
 
-Lịch mặc định
+XAUUSD SCALP BOT — TELEGRAM CONNECTED
+Workflow test has started.
+
+Sau đó bot mới lấy dữ liệu Twelve Data và gọi Gemini.
+
+Test mode gửi cả WAIT/NO TRADE; nếu bước phân tích lỗi, bot cố gửi XAUUSD TEST FAILED.
+
+Cách đọc lỗi trong Actions
+
+TELEGRAM_TOKEN invalid: token sai hoặc đã bị thu hồi.
+
+chat not found: TELEGRAM_CHAT_ID sai hoặc bot chưa được người dùng nhấn Start.
+
+bot was blocked by the user: tài khoản đã chặn bot.
+
+group chat was upgraded: cần cập nhật chat ID mới, thường có dạng số âm.
+
+TWELVEDATA_API_KEY is missing: secret chưa tạo đúng tên.
+
+Twelve Data không trả values: key/quota/symbol/data plan gặp lỗi.
+
+Gemini HTTP 404: model không tồn tại với project hiện tại.
+
+Gemini HTTP 429: vượt quota/rate limit.
+
+GitHub Secrets bắt buộc
+
+Tên phải giống tuyệt đối:
+
+TWELVEDATA_API_KEY
+GEMINI_API_KEY
+TELEGRAM_TOKEN
+TELEGRAM_CHAT_ID
+
+Không thêm dấu nháy vào giá trị secret. Với chat riêng, hãy nhấn Start cho bot trước.
+
+Lịch normal
 
 - cron: "1-56/5 6-21 * * 1-5"
 
-Tức 06:01-21:56 UTC, tương đương khoảng 13:01-04:56 giờ Việt Nam. Có thể giảmchi phí bằng cách thu hẹp xuống 07:00-17:59 UTC.
+Normal mode chỉ gửi BUY/SELL. Test mode luôn gửi kết quả để chẩn đoán.
 
-Update GitHub
-
-Ghi đè 4 file:
+Cấu trúc repository
 
 main.py
 requirements.txt
 README.md
-.github/workflows/signal.yml
+.github/
+└── workflows/
+    └── signal.yml
 
-Secrets giữ nguyên:
-
-TWELVEDATA_API_KEY
-
-GEMINI_API_KEY
-
-TELEGRAM_TOKEN
-
-TELEGRAM_CHAT_ID
-
-Sau khi upload, vào Actions → XAUUSD Scalp Signal → Run workflow và chọnforce_ai=true để test một lần.
-
-Setting chính
-
-Setting
-
-Mặc định
-
-MIN_SETUP_SCORE
-
-72
-
-MIN_RR
-
-1.50
-
-MIN_PREFILTER_SCORE
-
-4
-
-MAX_SIGNAL_AGE_MINUTES
-
-8
-
-MAX_ENTRY_DISTANCE_ATR_M5
-
-0.45
-
-NEWS veto trước/sau
-
-20/15 phút
-
-Mặc định chỉ gửi BUY/SELL, không gửi WAIT/NO TRADE để tránh spam.
-
-Lưu ý
-
-Chỉ dùng cho nghiên cứu và paper-trading. GitHub cron có thể trễ, AI Vision có thểđọc sai chart, và tín hiệu scalp hết hiệu lực nhanh. Không nối trực tiếp với chức năngđặt lệnh tự động.
+Chỉ dùng cho nghiên cứu và paper-trading; không nối trực tiếp với chức năng tự động đặt lệnh.
