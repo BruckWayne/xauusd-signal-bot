@@ -1,127 +1,102 @@
-# XAUUSD Multi-Timeframe Vision Signal Bot — bản nâng cấp
+XAUUSD AI Vision Scalp Bot
 
-Bot tự động lấy dữ liệu XAUUSD đa khung **H4/H1/M15/M5**, vẽ chart, gửi cho Gemini Vision phân tích Price Action + Order Block, sau đó chạy thêm một lớp **validator bằng code** trước khi gửi tín hiệu lên Telegram.
+Bản này chuyển hệ thống từ intraday sang scalp theo trình tự:
 
-> Mục tiêu của bản nâng cấp: không để AI Vision quyết định một mình. Gemini phân tích chart, còn code kiểm duyệt lại tín hiệu bằng rule kỹ thuật, tin tức, R:R, ATR và confidence.
+H1 bias → M15 setup → M5 confirmation → M1 trigger
 
-## Cấu trúc file
+Tần suất hợp lý
 
-```text
-.
-├── main.py
-├── requirements.txt
-└── .github/workflows/signal.yml
-```
+Workflow chạy mỗi 5 phút, gần sau khi nến M5 đóng. GitHub Actions không phù hợpvới gọi mỗi phút hoặc theo tick vì lịch có thể trễ. Code chỉ gọi Gemini khi prefilterphát hiện setup tiềm năng; nếu thị trường không đủ điều kiện thì chỉ ghi log.
 
-## Chức năng chính
+Cách giảm API
 
-1. Lấy dữ liệu XAU/USD từ Twelve Data cho 4 khung: **H4, H1, M15, M5**.
-2. Vẽ chart nến có thêm EMA 20/50/200 và đường giá hiện tại.
-3. Tính dữ liệu định lượng:
-   - ATR H1
-   - EMA 20/50/200
-   - bias H4/H1
-   - swing high/swing low gần nhất
-4. Kiểm tra lịch tin tức USD High Impact từ ForexFactory feed.
-5. Gửi ảnh chart + dữ liệu định lượng cho Gemini Vision.
-6. Gemini trả JSON theo schema: `BUY`, `SELL` hoặc `NO TRADE`.
-7. Code chạy validator sau Gemini:
-   - chặn lệnh nếu có tin USD High Impact trong vùng cấm,
-   - chặn nếu không xác minh được lịch tin,
-   - chặn nếu confidence thấp,
-   - chặn nếu entry/SL/TP sai cấu trúc,
-   - chặn nếu R:R thấp,
-   - chặn nếu SL quá rộng/quá sát so với ATR,
-   - chặn nếu entry quá xa giá hiện tại,
-   - chặn nếu BUY/SELL ngược hoàn toàn bias H4/H1.
-8. Gửi Telegram và ghi log lịch sử vào `logs/signals.csv` và `logs/signals.jsonl`.
-9. Workflow GitHub upload log thành artifact sau mỗi lần chạy để bạn tải về kiểm tra.
+Bot chỉ gọi Twelve Data một lần cho M1 (outputsize=5000) rồi resample thànhM5/M15/H1/H4. Nhờ vậy lịch 5 phút không cần gọi riêng từng timeframe.
 
-## Cài đặt GitHub Secrets
+Khung vận hành
 
-Vào repo GitHub → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**, thêm 4 biến bắt buộc:
+Khung
 
-| Biến | Ý nghĩa |
-|---|---|
-| `TWELVEDATA_API_KEY` | API key Twelve Data |
-| `GEMINI_API_KEY` | API key Google AI Studio/Gemini |
-| `TELEGRAM_TOKEN` | Token bot Telegram từ BotFather |
-| `TELEGRAM_CHAT_ID` | Chat ID nhận tín hiệu |
+Vai trò
 
-## Biến cấu hình tùy chọn
+H1
 
-Có thể thêm trong workflow hoặc GitHub Secrets/Variables nếu muốn tinh chỉnh:
+Bias và cản lớn
 
-| Biến | Mặc định | Ý nghĩa |
-|---|---:|---|
-| `MIN_CONFIDENCE` | `70` | Confidence tối thiểu để cho phép BUY/SELL |
-| `MIN_RR` | `1.2` | R:R tối thiểu với TP1 |
-| `MAX_ENTRY_DISTANCE_ATR` | `0.45` | Entry không được cách giá hiện tại quá 0.45 ATR H1 |
-| `MAX_SL_ATR_MULTIPLIER` | `1.35` | SL không được rộng hơn 1.35 ATR H1 |
-| `MIN_SL_ATR_MULTIPLIER` | `0.08` | SL không được quá sát so với ATR H1 |
-| `NEWS_LOOKAHEAD_HOURS` | `6` | Số giờ nhìn trước lịch tin High Impact |
-| `HIGH_IMPACT_VETO_BEFORE_MINUTES` | `60` | Cấm giao dịch trước tin High Impact |
-| `HIGH_IMPACT_VETO_AFTER_MINUTES` | `30` | Cấm giao dịch sau tin High Impact |
-| `SEND_NO_TRADE` | `true` | Có gửi Telegram khi NO TRADE hay không |
-| `LOG_DIR` | `logs` | Thư mục lưu log |
+M15
 
-## Lịch chạy
+Setup và location
 
-Workflow mặc định chạy vào phút thứ 2 mỗi giờ theo UTC:
+M5
 
-```yaml
-- cron: "2 * * * *"
-```
+Xác nhận cấu trúc
 
-Nếu muốn chạy 30 phút/lần:
+M1
 
-```yaml
-- cron: "*/30 * * * *"
-```
+Trigger/entry
 
-Lưu ý: GitHub Actions cron có thể chạy trễ vài phút vào giờ cao điểm.
+H4
 
-## Cách chạy thử
+Context phụ
 
-1. Upload các file lên repo GitHub.
-2. Đảm bảo file workflow nằm đúng đường dẫn: `.github/workflows/signal.yml`.
-3. Vào tab **Actions**.
-4. Chọn workflow **XAUUSD Hourly Signal**.
-5. Bấm **Run workflow**.
-6. Kiểm tra Telegram và log trong phần artifact của lần chạy.
+Lịch mặc định
 
-## Cách đọc log
+- cron: "1-56/5 6-21 * * 1-5"
 
-Sau mỗi lần chạy, workflow upload thư mục `logs` thành artifact tên `xauusd-signal-logs`.
+Tức 06:01-21:56 UTC, tương đương khoảng 13:01-04:56 giờ Việt Nam. Có thể giảmchi phí bằng cách thu hẹp xuống 07:00-17:59 UTC.
 
-Trong đó:
+Update GitHub
 
-- `signals.csv`: dễ mở bằng Excel/Google Sheets.
-- `signals.jsonl`: phù hợp để xử lý bằng Python sau này.
+Ghi đè 4 file:
 
-Các cột quan trọng:
+main.py
+requirements.txt
+README.md
+.github/workflows/signal.yml
 
-| Cột | Ý nghĩa |
-|---|---|
-| `final_verdict` | Kết luận cuối sau validator |
-| `confidence_percent` | Độ tin cậy AI trả về |
-| `risk_reward_tp1` | R:R đến TP1 |
-| `atr_h1` | ATR H1 tại thời điểm chạy |
-| `h4_bias`, `h1_bias` | Bias định lượng từ EMA |
-| `news_veto` | Có bị chặn bởi tin tức hay không |
-| `ghi_chu` | Lý do AI/validator |
+Secrets giữ nguyên:
 
-## Gợi ý vận hành thực tế
+TWELVEDATA_API_KEY
 
-- Nên chạy demo tối thiểu vài tuần trước khi dùng cho quyết định thật.
-- Không nên tự động vào lệnh ngay từ Telegram nếu chưa có thống kê hiệu quả.
-- Sau khi có đủ log, hãy đánh giá:
-  - tỷ lệ đúng sau 1h/3h/6h,
-  - lệnh bị chặn bởi validator có hợp lý không,
-  - R:R trung bình,
-  - thời điểm bot hay sai nhất,
-  - loại tin tức nào làm tín hiệu nhiễu nhiều nhất.
+GEMINI_API_KEY
 
-## Lưu ý rủi ro
+TELEGRAM_TOKEN
 
-Đây là công cụ hỗ trợ phân tích kỹ thuật bằng AI, không phải khuyến nghị đầu tư. AI Vision có thể đọc sai chart, dữ liệu API có thể lỗi hoặc trễ, lịch tin tức dùng nguồn công khai không chính thức. Luôn tự kiểm tra lại và quản lý rủi ro.
+TELEGRAM_CHAT_ID
+
+Sau khi upload, vào Actions → XAUUSD Scalp Signal → Run workflow và chọnforce_ai=true để test một lần.
+
+Setting chính
+
+Setting
+
+Mặc định
+
+MIN_SETUP_SCORE
+
+72
+
+MIN_RR
+
+1.50
+
+MIN_PREFILTER_SCORE
+
+4
+
+MAX_SIGNAL_AGE_MINUTES
+
+8
+
+MAX_ENTRY_DISTANCE_ATR_M5
+
+0.45
+
+NEWS veto trước/sau
+
+20/15 phút
+
+Mặc định chỉ gửi BUY/SELL, không gửi WAIT/NO TRADE để tránh spam.
+
+Lưu ý
+
+Chỉ dùng cho nghiên cứu và paper-trading. GitHub cron có thể trễ, AI Vision có thểđọc sai chart, và tín hiệu scalp hết hiệu lực nhanh. Không nối trực tiếp với chức năngđặt lệnh tự động.
