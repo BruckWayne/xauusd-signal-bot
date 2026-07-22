@@ -1,50 +1,62 @@
-name: XAUUSD Hourly Signal
+name: XAUUSD Scalp Signal
 
 on:
   schedule:
-    # Chạy vào phút 2 mỗi giờ UTC. GitHub cron có thể trễ vài phút.
-    - cron: "2 * * * *"
-  workflow_dispatch: {}
+    # Mỗi 5 phút, lệch phút đầu giờ để giảm nguy cơ GitHub queue.
+    # 06:01-21:56 UTC, thứ Hai-thứ Sáu.
+    - cron: "1-56/5 6-21 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      force_ai:
+        description: "Bỏ qua prefilter để test AI"
+        required: false
+        default: "false"
+
+concurrency:
+  group: xauusd-scalp-signal
+  cancel-in-progress: true
 
 jobs:
-  run-signal:
+  run-scalp:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    timeout-minutes: 8
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: "pip"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run signal bot
+      - run: pip install --disable-pip-version-check -r requirements.txt
+      - name: Run scalp analyzer
         env:
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MIN_CONFIDENCE: "70"
-          MIN_RR: "1.2"
-          MAX_ENTRY_DISTANCE_ATR: "0.45"
-          NEWS_LOOKAHEAD_HOURS: "6"
-          HIGH_IMPACT_VETO_BEFORE_MINUTES: "60"
-          HIGH_IMPACT_VETO_AFTER_MINUTES: "30"
-          SEND_NO_TRADE: "true"
+          SYMBOL: "XAU/USD"
+          GEMINI_MODEL: "gemini-2.5-flash"
+          SCALP_SESSION_UTC: "06:00-21:59"
+          FORCE_AI_CALL: ${{ github.event.inputs.force_ai || 'false' }}
+          MIN_SETUP_SCORE: "72"
+          MIN_RR: "1.50"
+          MIN_PREFILTER_SCORE: "4"
+          MIN_M5_ATR_PCT: "0.025"
+          MAX_ENTRY_DISTANCE_ATR_M5: "0.45"
+          MIN_SL_ATR_M5: "0.35"
+          MAX_SL_ATR_M5: "1.80"
+          MAX_SIGNAL_AGE_MINUTES: "8"
+          HIGH_IMPACT_VETO_BEFORE_MINUTES: "20"
+          HIGH_IMPACT_VETO_AFTER_MINUTES: "15"
+          SEND_WAIT: "false"
+          SEND_NO_TRADE: "false"
+          SEND_CHART: "true"
           LOG_DIR: "logs"
         run: python main.py
-
-      - name: Upload signal logs
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: xauusd-signal-logs
+          name: xauusd-scalp-${{ github.run_id }}
           path: logs/
           if-no-files-found: ignore
           retention-days: 30
